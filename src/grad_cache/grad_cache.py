@@ -1,13 +1,9 @@
-from random import random
-from time import time
 from typing import List, Union, Callable, Any
 from contextlib import nullcontext
 from itertools import repeat
 from collections import UserDict
 import logging
-import gc, time
 
-# import numpy as np
 import torch
 from torch import nn, Tensor
 from torch.cuda.amp import GradScaler, autocast
@@ -84,10 +80,7 @@ class GradCache:
         # delegate splitting to user provided function
         if self.split_input_fn is not None:
             return self.split_input_fn(model_input, chunk_size)
-        
-        # Returns a list of size 1
-        # in this list, is a dict of input_ids, and attention mask
-        # value is tensor
+
         if isinstance(model_input, (dict, UserDict)) and all(isinstance(x, Tensor) for x in model_input.values()):
             keys = list(model_input.keys())
             chunked_tensors = [model_input[k].split(chunk_size, dim=0) for k in keys]
@@ -98,15 +91,13 @@ class GradCache:
             return [list(s) for s in zip(*chunked_x)]
 
         elif isinstance(model_input, Tensor):
-            print("In split")
-            print(model_input.shape)
-
             return list(model_input.split(chunk_size, dim=0))
-            
-        elif isinstance(model_input, tuple): # and list(map(type, model_input)) == [list, dict]:
+
+        elif isinstance(model_input, tuple) and list(map(type, model_input)) == [list, dict]:
             args_chunks = self.split_inputs(model_input[0], chunk_size)
             kwargs_chunks = self.split_inputs(model_input[1], chunk_size)
             return list(zip(args_chunks, kwargs_chunks))
+
         else:
             raise NotImplementedError(f'Model input split not implemented for type {type(model_input)}')
 
@@ -150,10 +141,8 @@ class GradCache:
             elif isinstance(model_input, tuple) and list(map(type, model_input)) == [list, dict]:
                 model_args, model_kwargs = model_input
                 return model(*model_args, **model_kwargs)
-            elif isinstance(model_input, (np.ndarray)) and hasattr(model, 'forward_passages') and callable(getattr(model, 'forward_passages')):
-                return model.forward_passages(model_input.tolist())
             else:
-                raise NotImplementedError(f'Model input split not implemented for type {type(model_input)}')
+                raise NotImplementedError
 
     def get_reps(self, model_out) -> Tensor:
         """
@@ -181,8 +170,6 @@ class GradCache:
             self,
             model: nn.Module,
             model_inputs,
-            chunk_size: int = None,
-            third: bool = False,
     ) -> [Tensor, List[RandContext]]:
         """
         The first forward pass without gradient computation.
@@ -190,96 +177,46 @@ class GradCache:
         :param model_inputs: Model input already broken into chunks.
         :return: A tuple of a) representations and b) recorded random states.
         """
-        # rnd_states = []
-        
-        if third:
-            '''
-            Store each query passage pair first
-            '''
-            p_reps = []
-            q_reps = []
-            for query in model_inputs[0]: # pair every query with each passage
-                q_in = [query]*len(model_inputs[1])
-                p_in = [passage for passage in model_inputs[1]]
-                q_in = torch.stack(q_in, dim=0)
-                p_in = torch.stack(p_in, dim=0)
-                
-                end = chunk_size
-                for start in range(0, len(q_in), chunk_size):
-                    q = q_in[start:end]
-                    p = p_in[start:end]
-                    q_emb, p_emb = self.model_call(model, [q, p])
-                    # rnd_states.append(RandContext(*self.get_input_tensors([q, p])))
-                    q_reps.append(self.get_reps(q_emb))
-                    p_reps.append(self.get_reps(p_emb))
-                    end += chunk_size
+        rnd_states = []
+        model_reps = []
 
-            # '''
-            # Get rep for each pair splitted into chunk size
-            # '''
-            # end = chunk_size
-            # with torch.no_grad():
-            #     for start in range(0, len(q_in), chunk_size):
-            #         q = q_in[start:end]
-            #         p = p_in[start:end]
-            #         q_emb, p_emb = self.model_call(model, [q, p])
-            #         rnd_states.append(RandContext(*self.get_input_tensors([q, p])))
-            #         q_reps.append(self.get_reps(q_emb))
-            #         p_reps.append(self.get_reps(p_emb))
-            #         end += chunk_size
+        with torch.no_grad():
+            for x in model_inputs:
+                rnd_states.append(RandContext(*self.get_input_tensors(x)))
+                y = self.model_call(model, x)
+                model_reps.append(self.get_reps(y))
 
-            '''
-            Convert to Tensor of dim 2
-            '''
+        # concatenate all sub-batch representations
+        model_reps = torch.cat(model_reps, dim=0)
+        return model_reps, rnd_states
 
-            q_reps = torch.stack(q_reps, dim=1)
-            p_reps = torch.stack(p_reps, dim=1)
-            return q_reps, p_reps # , rnd_states
-            
-        else:
-            model_reps = []
-            with torch.no_grad():
-                for x in model_inputs:
-                    rnd_states.append(RandContext(*self.get_input_tensors(x)))
-                    y = self.model_call(model, x)
-                    model_reps.append(self.get_reps(y))
-                    
-            # concatenate all sub-batch representations
-            model_reps = torch.cat(model_reps, dim=0)
-            return model_reps, rnd_states
-
-    def build_cache(self, num_queries: int, reps: Tensor) -> [List[Tensor], Tensor]:
+    def build_cache(self, *reps: Tensor, **loss_kwargs) -> [List[Tensor], Tensor]:
         """
         Compute the gradient cache
         :param reps: Computed representations from all encoder models
         :param loss_kwargs: Extra keyword arguments to the loss function
         :return: A tuple of a) gradient cache for each encoder model, and b) loss tensor
         """
-
-        # reps = [r.detach().requires_grad_() for r in reps]
+        reps = [r.detach().requires_grad_() for r in reps]
         with autocast() if self.fp16 else nullcontext():
-            loss = self.compute_loss(num_queries=num_queries, x2=reps[0].to("cuda:0"), y2=reps[1].to("cuda:0"))
+            loss = self.compute_loss(*reps, **loss_kwargs)
 
         if self.fp16:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
 
-        # cache = [r.grad for r in reps]
-        # del reps
-        # gc.collect()
-        return loss.detach()
-        # return cache, loss.detach()
-        
+        cache = [r.grad for r in reps]
+
+        return cache, loss.detach()
+
     def forward_backward(
             self,
             model: nn.Module,
             model_inputs,
             cached_gradients: List[Tensor],
             random_states: List[RandContext],
-            no_sync_except_last: bool = False,
-            scorer: bool = False,
-            chunk_size: int = None,
+            no_sync_except_last: bool = False
     ):
         """
         Run the second forward and the backward pass to compute gradient for a model.
@@ -295,36 +232,14 @@ class GradCache:
         else:
             sync_contexts = [nullcontext for _ in range(len(model_inputs))]
 
-        if not scorer:
-            for x, state, gradient, sync_context in zip(model_inputs, random_states, cached_gradients, sync_contexts):
-                with sync_context():
-                    with state:
-                        y = self.model_call(model, x)
-                    reps = self.get_reps(y)
+        for x, state, gradient, sync_context in zip(model_inputs, random_states, cached_gradients, sync_contexts):
+            with sync_context():
+                with state:
+                    y = self.model_call(model, x)
+                reps = self.get_reps(y)
 
-                    surrogate = torch.dot(reps.flatten(), gradient.flatten())
-                    surrogate.backward()
-        else:
-            '''
-            Loop through each pair according to chunk size
-            Compute the reps for query and passage
-            Perform backward for both reps
-            '''
-            end, idx = chunk_size, 0
-            for start in range(0, len(model_inputs[0]), chunk_size):
-                with random_states[idx]:
-                    q_emb, p_emb  = self.model_call(model, [model_inputs[0][start:end],
-                                                            model_inputs[1][start:end]])
-                    reps = self.get_reps(q_emb)
-                    surrogate = torch.dot(reps.flatten(), cached_gradients[0][start:end].flatten().to('cuda:0'))
-                    surrogate.backward(retain_graph=True)
-
-                    reps = self.get_reps(p_emb)
-                    surrogate = torch.dot(reps.flatten(), cached_gradients[1][start:end].flatten().to('cuda:0'))
-                    surrogate.backward(retain_graph=False)
-
-                idx += 1
-                end += chunk_size
+                surrogate = torch.dot(reps.flatten(), gradient.flatten())
+                surrogate.backward()
 
     def cache_step(
             self,
@@ -340,83 +255,26 @@ class GradCache:
         :param loss_kwargs: Additional keyword arguments to the loss function.
         :return: The current's loss.
         """
-
         all_reps = []
-        # all_rnd_states = []
+        all_rnd_states = []
 
         if no_sync_except_last:
             assert all(map(lambda m: isinstance(m, nn.parallel.DistributedDataParallel), self.models)), \
                 'Some of models are not wrapped in DistributedDataParallel. Make sure you are running DDP with ' \
                 'proper initializations.'
-        '''
-        0) Split inputs into list of chunk size
-        '''
-        # model_inputs = [self.split_inputs(x, chunk_size) for x, chunk_size in zip(model_inputs, self.chunk_sizes)]
 
-        '''
-        1) Forward for the dual encoders first to get rep
-        '''
-        # for model, x in zip(self.models[:2], model_inputs):
-        #     model_reps, _ = self.forward_no_grad(model, x, third=False)
-        #     all_reps.append(model_reps)
-            # all_rnd_states.append(rnd_states)
-        # torch.cuda.empty_cache()
+        model_inputs = [self.split_inputs(x, chunk_size) for x, chunk_size in zip(model_inputs, self.chunk_sizes)]
 
-        '''
-        2) Forward for the cross attn model to get updated 
-        '''
-        chunk = self.chunk_sizes[0]
-        num_queries = model_inputs[0][0].size(0)
-                
-        q_emb, p_emb = self.forward_no_grad(self.models[-1], 
-                        [model_inputs[0][0], model_inputs[0][1]], chunk_size=chunk, third=True) # forward the dual encoder's rep to cross attn model
+        for model, x in zip(self.models, model_inputs):
+            model_reps, rnd_states = self.forward_no_grad(model, x)
+            all_reps.append(model_reps)
+            all_rnd_states.append(rnd_states)
 
-        size = q_emb.size(0)*q_emb.size(1)
-        torch.cuda.empty_cache()
-        q_emb = q_emb.reshape(size, 768)
-        p_emb = p_emb.reshape(size, 768)
-        # print("forwarding out")
-        # print(p_emb.shape)
-        # print(q_emb.shape)
+        cache, loss = self.build_cache(*all_reps, **loss_kwargs)
+        cache = [c.split(chunk_size) for c, chunk_size in zip(cache, self.chunk_sizes)]
 
-        '''
-        3) Compute loss and get gradients
-        '''
-        # cache, loss = self.build_cache(num_queries=num_queries, reps=[q_emb, p_emb]) 
-        loss = self.build_cache(num_queries=num_queries, reps=[q_emb, p_emb])    
-        # del q_emb, p_emb, num_queries, size
-        # gc.collect()
-        torch.cuda.empty_cache()
+        for model, x, model_cache, rnd_states in zip(
+                self.models, model_inputs, cache, all_rnd_states):
+            self.forward_backward(model[:1], x[:1], model_cache[:1], rnd_states, no_sync_except_last=no_sync_except_last)
 
-        # cache, loss = self.build_cache(*all_reps, **loss_kwargs)    
-        # num_queries = len(model_inputs[0]) * self.chunk_sizes[0]   
-        # cache = torch.split(cache[-1], num_queries*2) # shape of queries by passages
-
-        # cache = [c.split(chunk_size) for c, chunk_size in zip(cache[:2], self.chunk_sizes)]
-
-        # re perform forward and backward for dual encoder followed by scorer
-        # for model, x, model_cache, rnd_states in zip(
-        #         self.models[:2], model_inputs, cache, all_rnd_states):
-        #     self.forward_backward(model, x, model_cache, rnd_states, no_sync_except_last=no_sync_except_last, scorer=False)
-
-
-        ''' 
-        4) Re perform forward and backward starting from cross attn model
-        '''
-        # q_in = []
-        # p_in = []
-        # for query in all_reps[0]:
-        #     for passage in all_reps[1]:
-        #         q_in.append(query)
-        #         p_in.append(passage)
-        
-        # q_in = torch.stack(q_in, dim=0)
-        # p_in = torch.stack(p_in, dim=0)
-        # del model_inputs, all_reps
-        # gc.collect()
-
-        # self.forward_backward(
-        #     self.models[-1], [q_in, p_in], cache, rnd_states, 
-        #     no_sync_except_last=no_sync_except_last, scorer=True, chunk_size=chunk)
-        
         return loss
