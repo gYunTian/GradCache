@@ -183,6 +183,7 @@ class GradCache:
         with torch.no_grad():
             for x in model_inputs:
                 rnd_states.append(RandContext(*self.get_input_tensors(x)))
+                if len(x) == 1: continue
                 y = self.model_call(model, x)
                 model_reps.append(self.get_reps(y))
 
@@ -275,6 +276,6 @@ class GradCache:
 
         for model, x, model_cache, rnd_states in zip(
                 self.models, model_inputs, cache, all_rnd_states):
-            self.forward_backward(model[:1], x[:1], model_cache[:1], rnd_states, no_sync_except_last=no_sync_except_last)
+            self.forward_backward(model, x, model_cache, rnd_states, no_sync_except_last=no_sync_except_last)
 
         return loss
